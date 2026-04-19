@@ -1,0 +1,8 @@
+.env
+politibotenv/
+Archives/
+bot_exp.py
+database.json
+start_bot.vbs
+bot.log
+.idea
