@@ -7,10 +7,23 @@ import ssl
 import io
 from datetime import datetime
 from ai import get_reaction, get_reaction_ordre, get_titres_noblesse, build_prompt_religieux, build_prompt_noblesse, build_prompt_peuple
+import ctypes
+import subprocess
+from updater import setup_updater
+
+VERSION = "1.1.4"
+
+# Renommer la fenêtre PowerShell
+def set_window_title(title: str):
+    try:
+        ctypes.windll.kernel32.SetConsoleTitleW(title)
+    except Exception:
+        pass
+
+set_window_title(f"Politibot v{VERSION}")
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-VERSION = "1.1.0"
 
 load_dotenv()
 
@@ -84,6 +97,7 @@ async def on_ready():
             name=f"v{VERSION}"
         )
     )
+    setup_updater(bot)
 
 # ══════════════════════════════════════════════════════════════
 #  COMMANDES INFO
@@ -432,37 +446,214 @@ async def recuperer_messages(interaction: discord.Interaction):
 #  COMMANDES CALENDRIER RP
 # ══════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="set_annee", description="[ADMIN] Définir l'année RP et la correspondance IRL")
+from discord.ext import tasks
+from datetime import datetime, timedelta
+
+# ── Helpers config ────────────────────────────────────────────
+
+def get_config(guild_id: str) -> dict:
+    data = load_db()
+    return data.get("_config", {}).get(guild_id, {
+        "annee_rp": 1,
+        "mois_rp": 1,
+        "jour_rp": 1,
+        "debut_irl": None,
+        "ratio_jours": 1,      # 1 jour IRL = X jours RP
+        "statut": "arrete",    # "actif", "pause", "arrete"
+        "channel_calendrier": None,
+        "derniere_maj": None
+    })
+
+def save_config(guild_id: str, config: dict):
+    data = load_db()
+    if "_config" not in data:
+        data["_config"] = {}
+    data["_config"][guild_id] = config
+    save_db(data)
+
+def get_date_rp(guild_id: str) -> dict:
+    config = get_config(guild_id)
+    if config["statut"] != "actif" or not config.get("debut_irl"):
+        return {
+            "jour": config.get("jour_rp", 1),
+            "mois": config.get("mois_rp", 1),
+            "annee": config.get("annee_rp", 1)
+        }
+    debut = datetime.fromisoformat(config["debut_irl"])
+    maintenant = datetime.now()
+    jours_ecoules = (maintenant - debut).days
+    ratio = config.get("ratio_jours", 1)
+    jours_rp_total = (config.get("jour_rp", 1) - 1) + (jours_ecoules * ratio)
+    annee_depart = config.get("annee_rp", 1)
+    mois_depart = config.get("mois_rp", 1)
+
+    # Calcul date RP
+    total_mois = (mois_depart - 1) + (jours_rp_total // 30)
+    jour = (jours_rp_total % 30) + 1
+    annee = annee_depart + (total_mois // 12)
+    mois = (total_mois % 12) + 1
+
+    return {"jour": jour, "mois": mois, "annee": annee}
+
+MOIS_NOMS = [
+    "", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+    "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"
+]
+
+SAISON_IMAGES = {
+    "printemps": "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6e/Spring_forest_mount_tai.jpg/1280px-Spring_forest_mount_tai.jpg",
+    "ete":       "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/24701-nature-natural-beauty.jpg/1280px-24701-nature-natural-beauty.jpg",
+    "automne":   "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/Camponotus_flavomarginatus_ant.jpg/1280px-Camponotus_flavomarginatus_ant.jpg",
+    "hiver":     "https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Fresh_snow.JPG/1280px-Fresh_snow.JPG"
+}
+
+
+def get_saison(mois: int) -> str:
+    if mois in [3, 4, 5]:   return "printemps"
+    if mois in [6, 7, 8]:   return "ete"
+    if mois in [9, 10, 11]: return "automne"
+    return "hiver"
+
+SAISON_EMOJI = {
+    "printemps": "🌸", "ete": "☀️", "automne": "🍂", "hiver": "❄️"
+}
+
+def build_embed_calendrier(date: dict, guild_id: str) -> discord.Embed:
+    saison = get_saison(date["mois"])
+    emoji = SAISON_EMOJI[saison]
+    mois_nom = MOIS_NOMS[date["mois"]]
+    config = get_config(guild_id)
+    statut = {"actif": "▶️ En cours", "pause": "⏸️ En pause", "arrete": "⏹️ Arrêté"}.get(config["statut"], "")
+
+    embed = discord.Embed(
+        title=f"{emoji} Calendrier du Royaume",
+        description=f"## 📅 {date['jour']} {mois_nom} {date['annee']}",
+        color={"printemps": 0x2ECC71, "ete": 0xF1C40F, "automne": 0xE67E22, "hiver": 0x3498DB}[saison]
+    )
+    embed.add_field(name="Saison", value=f"{emoji} {saison.capitalize()}", inline=True)
+    embed.add_field(name="Statut RP", value=statut, inline=True)
+    embed.add_field(name="Ratio", value=f"1 jour IRL = {config.get('ratio_jours', 1)} jour(s) RP", inline=True)
+    embed.set_image(url=SAISON_IMAGES[saison])
+    embed.set_footer(text="Politibot • Calendrier RP")
+    return embed
+
+# ── Tâche automatique quotidienne ─────────────────────────────
+
+@tasks.loop(hours=24)
+async def tick_calendrier():
+    db = load_db()
+    configs = db.get("_config", {})
+    for guild_id, config in configs.items():
+        if config.get("statut") != "actif":
+            continue
+        channel_id = config.get("channel_calendrier")
+        if not channel_id:
+            continue
+        channel = bot.get_channel(int(channel_id))
+        if not channel:
+            continue
+        date = get_date_rp(guild_id)
+        embed = build_embed_calendrier(date, guild_id)
+        await channel.send(embed=embed)
+
+@tick_calendrier.before_loop
+async def before_tick():
+    await bot.wait_until_ready()
+
+# ── Commandes ─────────────────────────────────────────────────
+
+@bot.tree.command(name="set_annee", description="[ADMIN] Configurer le calendrier RP")
 @discord.app_commands.describe(
-    annee="L'année RP actuelle (ex: 1450)",
-    ratio="Nb de mois RP par mois IRL (ex: 12 = 1 an RP par mois IRL)",
-    demarrer="Démarre le compteur IRL maintenant"
+    annee="Année RP de départ (ex: 1336)",
+    mois="Mois RP de départ (1-12)",
+    jour="Jour RP de départ (1-30)",
+    ratio_jours="Nb de jours RP par jour IRL (ex: 7)",
+    channel="Salon où afficher le calendrier chaque jour",
+    demarrer="Démarre le RP immédiatement"
 )
-async def set_annee(interaction: discord.Interaction, annee: int, ratio: int = 12, demarrer: bool = True):
+async def set_annee(interaction: discord.Interaction,
+                    annee: int,
+                    mois: int = 1,
+                    jour: int = 1,
+                    ratio_jours: int = 1,
+                    channel: discord.TextChannel = None,
+                    demarrer: bool = True):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Commande réservée aux administrateurs.", ephemeral=True)
         return
+
     config = {
         "annee_rp": annee,
-        "ratio": ratio,
-        "debut_irl": datetime.now().isoformat() if demarrer else None
+        "mois_rp": mois,
+        "jour_rp": jour,
+        "ratio_jours": ratio_jours,
+        "debut_irl": datetime.now().isoformat() if demarrer else None,
+        "statut": "actif" if demarrer else "arrete",
+        "channel_calendrier": str(channel.id) if channel else get_config(str(interaction.guild_id)).get("channel_calendrier"),
+        "derniere_maj": datetime.now().isoformat()
     }
     save_config(str(interaction.guild_id), config)
-    embed = discord.Embed(title="📅 Année RP configurée", color=0x2ECC71)
-    embed.add_field(name="Année RP", value=str(annee), inline=True)
-    embed.add_field(name="Ratio", value=f"1 mois IRL = {ratio} mois RP", inline=True)
-    embed.add_field(name="Compteur", value="✅ Démarré" if demarrer else "⏸️ Manuel", inline=True)
+
+    if demarrer and not tick_calendrier.is_running():
+        tick_calendrier.start()
+
+    embed = discord.Embed(title="📅 Calendrier RP configuré", color=0x2ECC71)
+    embed.add_field(name="Date de départ", value=f"{jour} {MOIS_NOMS[mois]} {annee}", inline=True)
+    embed.add_field(name="Ratio", value=f"1 jour IRL = {ratio_jours} jour(s) RP", inline=True)
+    embed.add_field(name="Statut", value="▶️ Démarré" if demarrer else "⏹️ En attente", inline=True)
+    if channel:
+        embed.add_field(name="Salon calendrier", value=channel.mention, inline=True)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="annee", description="Affiche l'année RP actuelle")
+
+@bot.tree.command(name="annee", description="Afficher la date RP actuelle")
 async def annee(interaction: discord.Interaction):
-    annee_actuelle = get_annee_actuelle(str(interaction.guild_id))
-    config = get_config(str(interaction.guild_id))
-    embed = discord.Embed(title="📅 Calendrier RP", color=0xF1C40F)
-    embed.add_field(name="Année RP", value=f"**{annee_actuelle}**", inline=True)
-    embed.add_field(name="Ratio", value=f"1 mois IRL = {config.get('ratio', 12)} mois RP", inline=True)
+    date = get_date_rp(str(interaction.guild_id))
+    embed = build_embed_calendrier(date, str(interaction.guild_id))
     await interaction.response.send_message(embed=embed)
 
-# ══════════════════════════════════════════════════════════════
 
+@bot.tree.command(name="rp_statut", description="[ADMIN] Gérer le statut du RP (pause/resume/stop)")
+@discord.app_commands.describe(
+    action="Action à effectuer"
+)
+@discord.app_commands.choices(action=[
+    discord.app_commands.Choice(name="▶️ Reprendre", value="resume"),
+    discord.app_commands.Choice(name="⏸️ Mettre en pause", value="pause"),
+    discord.app_commands.Choice(name="⏹️ Arrêter", value="stop"),
+])
+async def rp_statut(interaction: discord.Interaction, action: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Commande réservée aux administrateurs.", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    config = get_config(guild_id)
+
+    if action == "pause":
+        # Sauvegarde la date actuelle avant de pauser
+        date = get_date_rp(guild_id)
+        config["statut"] = "pause"
+        config["jour_rp"] = date["jour"]
+        config["mois_rp"] = date["mois"]
+        config["annee_rp"] = date["annee"]
+        config["debut_irl"] = None
+        msg = "⏸️ RP mis en pause. La date est sauvegardée."
+
+    elif action == "resume":
+        config["statut"] = "actif"
+        config["debut_irl"] = datetime.now().isoformat()
+        if not tick_calendrier.is_running():
+            tick_calendrier.start()
+        msg = "▶️ RP repris !"
+
+    elif action == "stop":
+        config["statut"] = "arrete"
+        config["debut_irl"] = None
+        if tick_calendrier.is_running():
+            tick_calendrier.cancel()
+        msg = "⏹️ RP arrêté. Utilisez `/set_annee` pour en démarrer un nouveau."
+
+    save_config(guild_id, config)
+    await interaction.response.send_message(msg)
 bot.run(os.getenv('DISCORD_TOKEN'))
