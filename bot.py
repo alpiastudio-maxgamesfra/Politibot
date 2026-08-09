@@ -1,12 +1,18 @@
 import discord
 import os
+import logging
 from dotenv import load_dotenv
 from discord.ext import commands
 import json
-import ssl
 import io
 from datetime import datetime
-from ai import get_reaction, get_reaction_ordre, get_titres_noblesse, build_prompt_religieux, build_prompt_noblesse, build_prompt_peuple
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("politibot")
+from ai import get_reaction, get_reaction_ordre, get_reaction_ordre_religieux, get_titres_noblesse, build_prompt_noblesse, build_prompt_peuple
 import ctypes
 import subprocess
 from updater import setup_updater
@@ -22,13 +28,15 @@ def set_window_title(title: str):
 
 set_window_title(f"Politibot v{VERSION}")
 
-ssl._create_default_https_context = ssl._create_unverified_context
-
-
 load_dotenv()
 
 print("Lancement de Politibot...")
-bot = commands.Bot(command_prefix="/", intents=discord.Intents.all())
+
+# Seuls les intents réellement utilisés par le bot : lecture des serveurs,
+# des messages (pour /reagir, /recuperer_messages) et du contenu des messages.
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
 # ══════════════════════════════════════════════════════════════
 #  BASE DE DONNÉES
@@ -39,8 +47,14 @@ def load_db():
         return json.load(f)
 
 def save_db(data):
-    with open("database.json", "w", encoding="utf-8") as f:
+    # Écriture atomique : on écrit dans un fichier temporaire puis on
+    # remplace l'ancien d'un coup (os.replace est atomique sur la plupart
+    # des OS). Si le process crash pendant l'écriture, database.json
+    # original n'est jamais laissé à moitié écrit / corrompu.
+    tmp_path = "database.json.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, "database.json")
 
 def get_partis(db, guild_id: str, user_id: str):
     db.setdefault(guild_id, {})
@@ -48,31 +62,11 @@ def get_partis(db, guild_id: str, user_id: str):
     db[guild_id][user_id].setdefault("partis", {})
     return db[guild_id][user_id]["partis"]
 
-def get_config(guild_id: str) -> dict:
-    data = load_db()
-    return data.get("_config", {}).get(guild_id, {
-        "annee_rp": 1,
-        "debut_irl": None,
-        "ratio": 12
-    })
-
-def save_config(guild_id: str, config: dict):
-    data = load_db()
-    if "_config" not in data:
-        data["_config"] = {}
-    data["_config"][guild_id] = config
-    save_db(data)  # Partis et tout le reste intact
-
-def get_annee_actuelle(guild_id: str) -> int:
-    config = get_config(guild_id)
-    if not config.get("debut_irl"):
-        return config.get("annee_rp", 1)
-    debut = datetime.fromisoformat(config["debut_irl"])
-    maintenant = datetime.now()
-    jours_ecoules = (maintenant - debut).days
-    ratio = config.get("ratio", 12)
-    mois_rp = jours_ecoules * ratio / 30
-    return config["annee_rp"] + int(mois_rp / 12)
+def get_ordres_religieux(db, guild_id: str, user_id: str):
+    db.setdefault(guild_id, {})
+    db[guild_id].setdefault(user_id, {"partis": {}})
+    db[guild_id][user_id].setdefault("ordres_religieux", {})
+    return db[guild_id][user_id]["ordres_religieux"]
 
 def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator or \
@@ -127,12 +121,15 @@ async def liste_commandes(interaction: discord.Interaction):
     embed.set_footer(text=f"Politibot v{VERSION}")
     embed.add_field(name="/reagir", value="Faire réagir un parti à un message", inline=False)
     embed.add_field(name="/reagir_tous", value="Faire réagir tous les partis", inline=False)
-    embed.add_field(name="/reagir_religieux", value="Réaction d'un Ordre Religieux", inline=False)
+    embed.add_field(name="/reagir_religieux", value="Faire réagir un Ordre Religieux", inline=False)
     embed.add_field(name="/reagir_noblesse", value="Réaction de la Noblesse d'un pays", inline=False)
     embed.add_field(name="/reagir_peuple", value="Réaction du Peuple d'un pays", inline=False)
     embed.add_field(name="/ajout_parti", value="Ajouter un parti à la base", inline=False)
     embed.add_field(name="/supprimer_parti", value="Supprimer un parti de la base", inline=False)
     embed.add_field(name="/liste_partis", value="Lister tous les partis", inline=False)
+    embed.add_field(name="/ajout_ordre_religieux", value="Créer un Ordre Religieux", inline=False)
+    embed.add_field(name="/supprimer_ordre_religieux", value="Supprimer un Ordre Religieux", inline=False)
+    embed.add_field(name="/liste_ordres_religieux", value="Lister tous les Ordres Religieux", inline=False)
     embed.add_field(name="/recuperer_messages", value="Récupérer les 25 derniers messages du salon", inline=False)
     embed.add_field(name="/annee", value="Afficher l'année RP actuelle", inline=False)
     embed.add_field(name="/set_annee", value="[ADMIN] Définir l'année RP", inline=False)
@@ -218,8 +215,78 @@ async def liste_partis(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 # ══════════════════════════════════════════════════════════════
-#  COMMANDES RÉACTIONS
+#  COMMANDES ORDRES RELIGIEUX
 # ══════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="ajout_ordre_religieux", description="Créer un Ordre Religieux pour le roleplay")
+@discord.app_commands.describe(
+    ordre_id="Identifiant unique (ex: france_eglise)",
+    nom="Nom de l'Ordre (ex: L'Église de la Lumière)",
+    religion="Foi représentée (ex: Catholicisme, Islam, Shintoïsme...)",
+    chef="Nom/titre du chef de l'Ordre (ex: Grand Prêtre Aldric)",
+    couleur="Couleur hex (ex: #8B4513)",
+    contexte="Contexte religieux actuel"
+)
+async def ajout_ordre_religieux(interaction: discord.Interaction, ordre_id: str, nom: str, religion: str,
+                                chef: str, couleur: str = "#8B4513", contexte: str = ""):
+    db = load_db()
+    guild_id = str(interaction.guild_id)
+    user_id  = str(interaction.user.id)
+    ordres   = get_ordres_religieux(db, guild_id, user_id)
+
+    if ordre_id in ordres:
+        await interaction.response.send_message(f"❌ L'Ordre `{ordre_id}` existe déjà.")
+        return
+
+    ordres[ordre_id] = {
+        "nom": nom,
+        "religion": religion,
+        "chef": chef,
+        "couleur": couleur,
+        "contexte": contexte,
+        "historique": []
+    }
+    save_db(db)
+    await interaction.response.send_message(f"✅ Ordre Religieux `{nom}` ajouté avec l'ID `{ordre_id}` !")
+
+@bot.tree.command(name="supprimer_ordre_religieux", description="Supprimer un Ordre Religieux de la base de données")
+@discord.app_commands.describe(
+    ordre_id="Identifiant de l'Ordre à supprimer (ex: france_eglise)"
+)
+async def supprimer_ordre_religieux(interaction: discord.Interaction, ordre_id: str):
+    db = load_db()
+    guild_id = str(interaction.guild_id)
+    user_id  = str(interaction.user.id)
+    ordres   = get_ordres_religieux(db, guild_id, user_id)
+
+    if ordre_id not in ordres:
+        await interaction.response.send_message(f"❌ L'Ordre `{ordre_id}` n'existe pas.")
+        return
+
+    nom = ordres[ordre_id]["nom"]
+    del ordres[ordre_id]
+    save_db(db)
+    await interaction.response.send_message(f"✅ Ordre Religieux `{nom}` (`{ordre_id}`) supprimé.")
+
+@bot.tree.command(name="liste_ordres_religieux", description="Lister tous les Ordres Religieux enregistrés")
+async def liste_ordres_religieux(interaction: discord.Interaction):
+    db       = load_db()
+    guild_id = str(interaction.guild_id)
+    user_id  = str(interaction.user.id)
+    ordres   = get_ordres_religieux(db, guild_id, user_id)
+
+    if not ordres:
+        await interaction.response.send_message("❌ Aucun Ordre Religieux enregistré.")
+        return
+
+    embed = discord.Embed(title="✝️ Mes Ordres Religieux enregistrés", color=0x8B4513)
+    for ordre_id, ordre in ordres.items():
+        embed.add_field(
+            name=f"{ordre['nom']} (`{ordre_id}`)",
+            value=f"🙏 {ordre['religion']} • 👤 {ordre['chef']}",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="reagir", description="Faire réagir un parti politique à un événement")
 @discord.app_commands.describe(
@@ -278,10 +345,11 @@ async def reagir(interaction: discord.Interaction, parti_id: str, message_lien: 
         await interaction.followup.send("✅ Réaction envoyée !")
 
     except Exception as e:
+        logger.exception(f"Erreur /reagir (parti={parti_id})")
         if "429" in str(e):
             await interaction.followup.send("⏳ L'IA est temporairement surchargée, réessaie dans une minute.")
         else:
-            await interaction.followup.send(f"❌ Erreur IA : `{e}`")
+            await interaction.followup.send("❌ Une erreur est survenue pendant la génération de la réaction.")
 
 @bot.tree.command(name="reagir_tous", description="Faire réagir tous les partis à un événement")
 @discord.app_commands.describe(
@@ -336,36 +404,72 @@ async def reagir_tous(interaction: discord.Interaction, message_lien: str):
             embed.set_footer(text=f"Dirigeant : {parti['dirigeant']} • {parti['pays']}")
             await channel.send(embed=embed, reference=message_cible)
 
-        except Exception as e:
-            await channel.send(f"❌ Erreur pour `{parti_id}` : `{e}`")
+        except Exception:
+            logger.exception(f"Erreur /reagir_tous (parti={parti_id})")
+            await channel.send(f"❌ Une erreur est survenue pour le parti `{parti_id}`.")
 
     save_db(db)
     await interaction.followup.send("✅ Tous les partis ont réagi !")
 
-@bot.tree.command(name="reagir_religieux", description="Réaction d'un Ordre Religieux à un événement RP")
+@bot.tree.command(name="reagir_religieux", description="Faire réagir un Ordre Religieux à un événement")
 @discord.app_commands.describe(
-    religion="La religion de l'ordre (ex: Catholicisme, Islam, Shintoïsme...)",
-    message_lien="Lien du message auquel réagir"
+    ordre_id="Identifiant de l'Ordre Religieux (ex: france_eglise)",
+    message_lien="Lien du message auquel réagir (clic droit > Copier le lien)"
 )
-async def reagir_religieux(interaction: discord.Interaction, religion: str, message_lien: str):
+async def reagir_religieux(interaction: discord.Interaction, ordre_id: str, message_lien: str):
     await interaction.response.defer()
+
     try:
         parties    = message_lien.strip().split("/")
         channel_id = int(parties[-2])
         message_id = int(parties[-1])
-        channel = bot.get_channel(channel_id)
+    except (ValueError, IndexError):
+        await interaction.followup.send("❌ Lien de message invalide.")
+        return
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await interaction.followup.send("❌ Channel introuvable.")
+        return
+
+    try:
         message_cible = await channel.fetch_message(message_id)
-        reaction = await get_reaction_ordre(build_prompt_religieux, religion, message_cible.content)
+    except discord.NotFound:
+        await interaction.followup.send("❌ Message introuvable.")
+        return
+
+    db       = load_db()
+    guild_id = str(interaction.guild_id)
+    user_id  = str(interaction.user.id)
+    ordres   = get_ordres_religieux(db, guild_id, user_id)
+    ordre    = ordres.get(ordre_id)
+
+    if not ordre:
+        await interaction.followup.send(f"❌ Ordre Religieux `{ordre_id}` introuvable.")
+        return
+
+    try:
+        historique = ordre.get("historique", [])
+        reaction = await get_reaction_ordre_religieux(ordre, message_cible.content, historique)
+
+        ordre.setdefault("historique", [])
+        ordre["historique"].append({"role": "user",      "content": message_cible.content})
+        ordre["historique"].append({"role": "assistant", "content": reaction})
+        ordre["historique"] = ordre["historique"][-20:]
+        save_db(db)
+
         embed = discord.Embed(
-            title=f"✝️ Ordre Religieux — {religion}",
+            title=f"✝️ {ordre['nom']} réagit :",
             description=reaction,
-            color=0x8B4513
+            color=discord.Color.from_str(ordre.get("couleur", "#8B4513"))
         )
-        embed.set_footer(text=f"En réponse à : {message_cible.content[:100]}")
+        embed.set_footer(text=f"Chef de l'Ordre : {ordre['chef']} • {ordre['religion']}")
         await channel.send(embed=embed, reference=message_cible)
         await interaction.followup.send("✅ Réaction envoyée !")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erreur : `{e}`")
+
+    except Exception:
+        logger.exception(f"Erreur /reagir_religieux (ordre={ordre_id})")
+        await interaction.followup.send("❌ Une erreur est survenue pendant la génération de la réaction.")
 
 @bot.tree.command(name="reagir_noblesse", description="Réaction de la Noblesse d'un pays à un événement RP")
 @discord.app_commands.describe(
@@ -379,6 +483,9 @@ async def reagir_noblesse(interaction: discord.Interaction, pays: str, message_l
         channel_id = int(parties[-2])
         message_id = int(parties[-1])
         channel = bot.get_channel(channel_id)
+        if not channel:
+            await interaction.followup.send("❌ Channel introuvable.")
+            return
         message_cible = await channel.fetch_message(message_id)
         titres = get_titres_noblesse(pays)
         reaction = await get_reaction_ordre(build_prompt_noblesse, pays, message_cible.content)
@@ -391,8 +498,9 @@ async def reagir_noblesse(interaction: discord.Interaction, pays: str, message_l
         embed.set_footer(text=f"En réponse à : {message_cible.content[:100]}")
         await channel.send(embed=embed, reference=message_cible)
         await interaction.followup.send("✅ Réaction envoyée !")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erreur : `{e}`")
+    except Exception:
+        logger.exception("Erreur /reagir_noblesse")
+        await interaction.followup.send("❌ Une erreur est survenue pendant la génération de la réaction.")
 
 @bot.tree.command(name="reagir_peuple", description="Réaction du Peuple d'un pays à un événement RP")
 @discord.app_commands.describe(
@@ -406,6 +514,9 @@ async def reagir_peuple(interaction: discord.Interaction, pays: str, message_lie
         channel_id = int(parties[-2])
         message_id = int(parties[-1])
         channel = bot.get_channel(channel_id)
+        if not channel:
+            await interaction.followup.send("❌ Channel introuvable.")
+            return
         message_cible = await channel.fetch_message(message_id)
         reaction = await get_reaction_ordre(build_prompt_peuple, pays, message_cible.content)
         embed = discord.Embed(
@@ -416,8 +527,9 @@ async def reagir_peuple(interaction: discord.Interaction, pays: str, message_lie
         embed.set_footer(text=f"En réponse à : {message_cible.content[:100]}")
         await channel.send(embed=embed, reference=message_cible)
         await interaction.followup.send("✅ Réaction envoyée !")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erreur : `{e}`")
+    except Exception:
+        logger.exception("Erreur /reagir_peuple")
+        await interaction.followup.send("❌ Une erreur est survenue pendant la génération de la réaction.")
 
 # ══════════════════════════════════════════════════════════════
 #  COMMANDES RÉCUPÉRATION

@@ -32,12 +32,14 @@ def build_system_prompt(parti: dict) -> str:
     - Ne mentionne jamais que tu es une IA.
     """
 
-def build_prompt_religieux(religion: str) -> str:
-    return f"""Tu incarnes un Ordre Religieux de la foi {religion}.
-    Tu parles au nom de cet ordre, avec un ton solennel et dogmatique.
+def build_system_prompt_ordre_religieux(ordre: dict) -> str:
+    return f"""
+    Tu incarnes {ordre['nom']}, un Ordre Religieux de la foi {ordre['religion']}.
+    Chef de l'Ordre : {ordre.get('chef', 'Non défini')}
+    Contexte récent : {ordre.get('contexte', 'Aucun contexte disponible.')}
     Règles absolues :
-    - 1ère personne du pluriel.
-    - Ton d'un communiqué officiel religieux, 2-4 phrases maximum.
+    - Parle toujours au nom de l'Ordre, à la 1ère personne du pluriel.
+    - Ton solennel et dogmatique, celui d'un communiqué religieux officiel, 2-4 phrases maximum.
     - Tu es dans un jeu de rôle géopolitique, reste dans ce cadre.
     - Ne mentionne jamais que tu es une IA.
     """
@@ -93,6 +95,26 @@ async def get_reaction_ordre(prompt_fn, param: str, evenement: str, historique=[
     ]
     messages = [
         {"role": "system", "content": prompt_fn(param)},
+        *historique_normalise,
+        {"role": "user", "content": evenement}
+    ]
+    response = await client.chat.complete_async(
+        model="mistral-small-latest",
+        messages=messages,
+        temperature=0.85,
+        max_tokens=300
+    )
+    return response.choices[0].message.content
+
+async def get_reaction_ordre_religieux(ordre: dict, evenement: str, historique=[]):
+    client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+    historique_normalise = [
+        {"role": "assistant" if m["role"] == "model" else m["role"],
+         "content": m["content"]}
+        for m in historique
+    ]
+    messages = [
+        {"role": "system", "content": build_system_prompt_ordre_religieux(ordre)},
         *historique_normalise,
         {"role": "user", "content": evenement}
     ]
