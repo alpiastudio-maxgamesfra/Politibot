@@ -83,8 +83,9 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"Commandes Synchronisées: {len(synced)}")
+        print("Noms : " + ", ".join(sorted(c.name for c in synced)))
     except Exception as e:
-        print(e)
+        logger.exception("Échec de la synchronisation des commandes")
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.playing,
