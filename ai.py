@@ -44,23 +44,23 @@ def build_system_prompt_ordre_religieux(ordre: dict) -> str:
     - Ne mentionne jamais que tu es une IA.
     """
 
-def build_prompt_noblesse(pays: str) -> str:
-    titres = get_titres_noblesse(pays)
-    titre = titres[0]
-    return f"""Tu incarnes la Haute Noblesse de {pays}, représentée par un {titre}.
-    Tu parles avec l'arrogance et le prestige de la noblesse de {pays}.
+def build_system_prompt_ordre_noblesse(ordre: dict) -> str:
+    return f"""
+    Tu incarnes {ordre['nom']}, la Haute Noblesse de {ordre['pays']}, représentée par {ordre.get('titre', 'un noble')}.
+    Contexte récent : {ordre.get('contexte', 'Aucun contexte disponible.')}
     Règles absolues :
-    - 1ère personne.
-    - Ton aristocratique et hautain, 2-4 phrases maximum.
+    - Parle toujours au nom de la Noblesse, à la 1ère personne.
+    - Ton aristocratique et hautain, plein d'arrogance et de prestige, 2-4 phrases maximum.
     - Tu es dans un jeu de rôle géopolitique, reste dans ce cadre.
     - Ne mentionne jamais que tu es une IA.
     """
 
-def build_prompt_peuple(pays: str) -> str:
-    return f"""Tu incarnes le Peuple de {pays}, avec sa culture, ses traditions et ses préoccupations propres.
-    Tu parles au nom des gens ordinaires, avec un ton populaire et authentique propre à la culture de {pays}.
+def build_system_prompt_ordre_peuple(ordre: dict) -> str:
+    return f"""
+    Tu incarnes {ordre['nom']}, le Peuple de {ordre['pays']}, avec sa culture, ses traditions et ses préoccupations propres.
+    Contexte récent : {ordre.get('contexte', 'Aucun contexte disponible.')}
     Règles absolues :
-    - 1ère personne du pluriel.
+    - Parle toujours au nom du Peuple, à la 1ère personne du pluriel.
     - Ton populaire et culturellement ancré, 2-4 phrases maximum.
     - Tu es dans un jeu de rôle géopolitique, reste dans ce cadre.
     - Ne mentionne jamais que tu es une IA.
@@ -86,7 +86,7 @@ async def get_reaction(parti, evenement, historique=[]):
     )
     return response.choices[0].message.content
 
-async def get_reaction_ordre(prompt_fn, param: str, evenement: str, historique=[]):
+async def get_reaction_ordre_noblesse(ordre: dict, evenement: str, historique=[]):
     client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
     historique_normalise = [
         {"role": "assistant" if m["role"] == "model" else m["role"],
@@ -94,7 +94,27 @@ async def get_reaction_ordre(prompt_fn, param: str, evenement: str, historique=[
         for m in historique
     ]
     messages = [
-        {"role": "system", "content": prompt_fn(param)},
+        {"role": "system", "content": build_system_prompt_ordre_noblesse(ordre)},
+        *historique_normalise,
+        {"role": "user", "content": evenement}
+    ]
+    response = await client.chat.complete_async(
+        model="mistral-small-latest",
+        messages=messages,
+        temperature=0.85,
+        max_tokens=300
+    )
+    return response.choices[0].message.content
+
+async def get_reaction_ordre_peuple(ordre: dict, evenement: str, historique=[]):
+    client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+    historique_normalise = [
+        {"role": "assistant" if m["role"] == "model" else m["role"],
+         "content": m["content"]}
+        for m in historique
+    ]
+    messages = [
+        {"role": "system", "content": build_system_prompt_ordre_peuple(ordre)},
         *historique_normalise,
         {"role": "user", "content": evenement}
     ]
